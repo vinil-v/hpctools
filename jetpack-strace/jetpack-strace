@@ -1,0 +1,76 @@
+#!/bin/bash
+
+# Runs strace on the jetpackd converge child process.
+# This only does something meaningful when jetpackd is converging a cluster,
+# but you can trace a separate jetpack converge (or anything) by running this with a given pid.
+# This is handy for finding out where the converge is getting stuck. For instance,
+# some customers have reported seeing the converge hang when using certain NFS filers.
+
+# Note: strace sometimes decodes the pids incorrectly. In particular, it can 
+# attribute jetpack-initialize to the parent chef-solo pid. The pid itself is correct,
+# but the command name reported is misleading.
+
+get_processes() {
+    local PidCount=0
+    local PidList
+    # the tasks include threads which are processes in python, but the first task is the process itself, 
+    # which is what we get the children from.
+    PidList=$(cat "/proc/$1/task/$1/children") || fail "Could not read child processes for PID $1"
+    for child_pid in $PidList; do
+        get_processes "$child_pid"
+        PidCount=$((PidCount + 1))
+    done
+    if [ $PidCount -eq 0 ]; then
+        # this is the leaf process
+        echo "$1"
+        return
+    fi
+}
+
+trace_process() {
+    # -f to follow forked children
+    # filter out wait4/select because they spam the strace while processes are busy-waiting, and are not interesting
+    # -Y to show process names along with pids
+    # -o forces strace to always show the pid: https://github.com/strace/strace/issues/278
+    strace -p "$1" -f -e 'trace=!wait4,select' -Y -o /dev/tty || fail "Cannot strace"
+}
+
+fail() {
+    if [[ -n "$1" ]]; then
+        echo "ERROR: $1" >&2
+    fi
+    exit 1
+}
+
+ChildPid="$1"
+
+if [[ -n "$ChildPid" ]]; then
+    # trace till done then exit
+    trace_process "$ChildPid"
+    exit
+fi
+
+JetpackdPid=$(cat /run/jetpackd.pid)
+
+Logged=false
+while true; do
+    # we find and strace the childmost process directly, because if we strace the jetpackd process itself,
+    # strace will not trace the pre-existing child process, which is what we really want.
+    ChildPid=$(get_processes "$JetpackdPid") || fail
+    if [[ "$ChildPid" != "$JetpackdPid" ]]; then
+        trace_process "$ChildPid"
+        Logged=false
+    else
+        # wait for the child process to appear. We could strace jetpackd at this point,
+        # and when the child process gets forked, it would be followed. But stracing jetpackd directly
+        # straces the threads of jetpackd, which are busy polling for spot evictions and spamming the output.
+        # so since we need to strace the existing child process already (see above), we just wait for the child process to appear.
+        if [[ "$Logged" == "false" ]]; then
+            echo "No child processes found for PID $JetpackdPid; waiting for converge to start..."
+            Logged=true
+        fi
+        # very small sleep so we get the child process as quickly as possible.
+        sleep .5
+    fi
+
+done
