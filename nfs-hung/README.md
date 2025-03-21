@@ -38,7 +38,7 @@ At this point, the script hangs and does not proceed. This indicates an issue wi
 Try running the script with a different lock file that does not exist:
 
 ```
-python3 test.py test /newfile.lock
+python3 test.py test newfile.lock
 ```
 
 #### Expected Output
